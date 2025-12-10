@@ -39,6 +39,7 @@
 #include <condition_variable>
 #include <mutex>
 #include <future>
+#include <cstdlib>
 
 namespace XrdEc
 {
@@ -109,7 +110,7 @@ namespace XrdEc
       //-----------------------------------------------------------------------
       // Default constructor
       //-----------------------------------------------------------------------
-      BufferPool() : totalsize( 1024 ), currentsize( 0 )
+      BufferPool() : totalsize( MaxPoolSize() ), currentsize( 0 )
       {
       }
 
@@ -117,6 +118,18 @@ namespace XrdEc
       BufferPool( BufferPool&& ) = delete;                 //< Move constructor
       BufferPool& operator=( const BufferPool& ) = delete; //< Copy assigment operator
       BufferPool& operator=( BufferPool&& ) = delete;      //< Move assigment operator
+
+      inline static size_t MaxPoolSize()
+      {
+        const char *env = std::getenv( "XRDEC_BUFFERPOOL_LIMIT" );
+        if( env )
+        {
+          char *endp = nullptr;
+          unsigned long v = std::strtoul( env, &endp, 10 );
+          if( endp != env && v > 0 ) return static_cast<size_t>( v );
+        }
+        return 128; // default cap
+      }
 
       const size_t               totalsize;   //< maximum size of the pool
       size_t                     currentsize; //< current size of the pool

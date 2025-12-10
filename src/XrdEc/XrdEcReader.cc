@@ -214,6 +214,38 @@ namespace XrdEc
     }
 
     //-----------------------------------------------------------------------
+    // Thread-safe helpers for state/stripe management
+    //-----------------------------------------------------------------------
+    inline void set_state( size_t strpid, state_t newstate )
+    {
+      std::lock_guard<std::mutex> lck( mtx );
+      state[strpid] = newstate;
+    }
+
+    inline state_t get_state( size_t strpid )
+    {
+      std::lock_guard<std::mutex> lck( mtx );
+      return state[strpid];
+    }
+
+    inline void prepare_stripe( size_t strpid, size_t newsize, state_t newstate )
+    {
+      std::lock_guard<std::mutex> lck( mtx );
+      stripes[strpid].resize( newsize );
+      state[strpid] = newstate;
+    }
+
+    inline buffer_t& stripe_ref( size_t strpid )
+    {
+      return stripes[strpid];
+    }
+
+    inline std::mutex* mtx_ptr()
+    {
+      return &mtx;
+    }
+
+    //-----------------------------------------------------------------------
     // If neccessary trigger error correction procedure
     // @param self : the block_t object
     // @return     : false if the block is corrupted and cannot be recovered,
@@ -480,7 +512,8 @@ namespace XrdEc
     XrdCl::Pipeline p = objcfg.nomtfile
                       ? XrdCl::Parallel( opens ).AtLeast( objcfg.nbdata ) | ReadSize( 0 ) | XrdCl::Final( pipehndl )
                       : XrdCl::Parallel( ReadMetadata( 0 ),
-                                         XrdCl::Parallel( opens ).AtLeast( objcfg.nbdata ) ) >> pipehndl;
+                                         XrdCl::Parallel( opens ).AtLeast( objcfg.nbdata ),
+                                         ReadSize( 0 ) ) >> pipehndl;
     XrdCl::Async( std::move( p ), timeout );
   }
 
@@ -857,7 +890,7 @@ namespace XrdEc
 		missingChunksVectorRead.emplace_back(
 			std::make_tuple(blkid,strpid));
 	  }
-	currentBlock->state[strpid] = block_t::Missing;
+	currentBlock->set_state(strpid, block_t::Missing);
 	currentBlock->read(currentBlock, strpid, 0, objcfg.chunksize,
 			nullptr,
 			ErrorCorrected(this, currentBlock, blkid, strpid),
@@ -928,20 +961,32 @@ namespace XrdEc
 						std::make_shared<block_t>(blkid, *this, objcfg));
 			}
 
-			blockMap[blkid]->state[strpid] = block_t::Loading;
+      {
+        // ensure state/stripe preparation is synchronized
+        blockMap[blkid]->prepare_stripe(strpid, 0, block_t::Loading);
+      }
 			XrdCl::StatInfo* info = nullptr;
-			if(dataarchs[url]->Stat(objcfg.GetFileName(blkid, strpid), info).IsOK())
-				blockMap[blkid]->stripes[strpid].resize( info ->GetSize() );
+			if(!dataarchs[url]->Stat(objcfg.GetFileName(blkid, strpid), info).IsOK() || !info)
+			{
+        log->Dump(XrdCl::XRootDMsg, "EC Vector Read: Stat failed for block %zu stripe %zu.", blkid, strpid);
+        this->MissingVectorRead(blockMap[blkid], blkid, strpid, timeout);
+        remainLength -= rdsize;
+        currentOffset += rdsize;
+        continue;
+			}
+      uint32_t chunkSize = info->GetSize();
+      delete info;
+      blockMap[blkid]->prepare_stripe(strpid, chunkSize, block_t::Loading);
 
 		      auto requestChunk = std::make_tuple(indexOfArchive, blkid, strpid);
 		      if(requestedChunks.find(requestChunk) == requestedChunks.end())
 		    	  {
 		    	  uint64_t off = 0;
 		    	  dataarchs[url]->GetOffset(objcfg.GetFileName(blkid, strpid), off);
-		    	  hostLists[indexOfArchive].emplace_back(XrdCl::ChunkInfo(
-		    			  off,
-						  info ->GetSize(),
-						  blockMap[blkid]->stripes[strpid].data()));
+          hostLists[indexOfArchive].emplace_back(XrdCl::ChunkInfo(
+                          off,
+                          chunkSize,
+                          blockMap[blkid]->stripe_ref(strpid).data()));
 
 		    	  // fill list of requested chunks by block and stripe id
 		    	  requestedChunks.emplace(requestChunk);
@@ -1007,8 +1052,12 @@ namespace XrdEc
 												continue;
 											}
 											else{
-												currentBlock->state[strpid] = block_t::Valid;
-												bool recoverable = currentBlock->error_correction( currentBlock );
+												currentBlock->set_state(strpid, block_t::Valid);
+                        bool recoverable = false;
+                        {
+                          std::unique_lock<std::mutex> guard(*currentBlock->mtx_ptr());
+                          recoverable = block_t::error_correction( currentBlock );
+                        }
 												if(!recoverable)
 													log->Dump(XrdCl::XRootDMsg, "EC Vector Read: Couldn't recover block %zu.", blkid);
 											}
@@ -1044,18 +1093,20 @@ namespace XrdEc
 			      if( rdsize > remainLength ) rdsize = remainLength;
 
 				  // put received data into given buffers
-			      if(blockMap.find(blkid) == blockMap.end() || blockMap[blkid] == nullptr){
+          if(blockMap.find(blkid) == blockMap.end() || blockMap[blkid] == nullptr){
 			    	  log->Dump(XrdCl::XRootDMsg, "EC Vector Read: Missing block %zu.", blkid);
 			    	  failed = true;
 			    	  break;
 			      }
-			      if(blockMap[blkid]->state[strpid] != block_t::Valid){
-			    	  log->Dump(XrdCl::XRootDMsg, "EC Vector Read: Invalid stripe in block %zu stripe %zu.", blkid, strpid);
-			    	  failed = true;
-			    	  break;
-			      }
-
-			      memcpy(localBuffer, blockMap[blkid]->stripes[strpid].data() + rdoff, rdsize);
+          {
+            std::unique_lock<std::mutex> l(*blockMap[blkid]->mtx_ptr());
+            if(blockMap[blkid]->state[strpid] != block_t::Valid){
+              log->Dump(XrdCl::XRootDMsg, "EC Vector Read: Invalid stripe in block %zu stripe %zu.", blkid, strpid);
+              failed = true;
+              break;
+            }
+            memcpy(localBuffer, blockMap[blkid]->stripe_ref(strpid).data() + rdoff, rdsize);
+          }
 
 			      remainLength -= rdsize;
 			      currentOffset += rdsize;
