@@ -733,7 +733,7 @@ namespace XrdEc
     XrdCl::Fwd<void*>    rdbuff;
 
     return XrdCl::Open( *file, url, XrdCl::OpenFlags::Read ) >>
-             [index, size, rdbuff, rdsize, this]( XrdCl::XRootDStatus &st, XrdCl::StatInfo &info ) mutable
+             [index, size, rdbuff, rdsize, this, file]( XrdCl::XRootDStatus &st, XrdCl::StatInfo &info ) mutable
              {
                if( !st.IsOK() )
                {
@@ -746,7 +746,7 @@ namespace XrdEc
                rdbuff = new char[info.GetSize()];
              }
          | XrdCl::Read( *file, 0, rdsize, rdbuff ) >>
-             [index, size, this]( XrdCl::XRootDStatus &st, XrdCl::ChunkInfo &ch )
+             [index, size, this, file]( XrdCl::XRootDStatus &st, XrdCl::ChunkInfo &ch )
              {
                if( !st.IsOK() )
                {
@@ -763,7 +763,7 @@ namespace XrdEc
                }
              }
          | XrdCl::Close( *file ) >>
-             []( XrdCl::XRootDStatus &st )
+             [file]( XrdCl::XRootDStatus &st )
              {
                if( !st.IsOK() )
                  XrdCl::Pipeline::Ignore(); // ignore errors, we don't really care
@@ -910,6 +910,7 @@ namespace XrdEc
 	  }
 
 	  auto log = XrdCl::DefaultEnv::GetLog();
+    log->Dump(XrdCl::XRootDMsg, "EC Vector Read: requested %zu chunks", chunks.size());
 
 	  //bool useGlobalBuffer = buffer != nullptr;
 	  char* globalBuffer = (char*)buffer;
@@ -942,15 +943,27 @@ namespace XrdEc
 		      auto itr = urlmap.find( fn );
 		      if( itr == urlmap.end() )
 		      {
-		        log->Dump(XrdCl::XRootDMsg, "EC Vector Read: No mapping of file to host found.");
-		        break;
+            // Fallback: derive host from stripe id (stripe-per-host placement)
+            size_t inferred_host = strpid;
+            if( inferred_host < objcfg.plgr.size() )
+            {
+              const std::string &fallbackUrl = objcfg.GetDataUrl( inferred_host );
+              log->Dump(XrdCl::XRootDMsg, "EC Vector Read: No mapping for %s, using inferred host %zu url %s.", fn.c_str(), inferred_host, fallbackUrl.c_str());
+              urlmap.emplace( fn, fallbackUrl );
+              itr = urlmap.find( fn );
+            }
+            else
+            {
+              log->Dump(XrdCl::XRootDMsg, "EC Vector Read: No mapping of file %s to host found.", fn.c_str());
+              break;
+            }
 		      }
 		      // get the URL of the ZIP archive with the respective data
 		      const std::string &url = itr->second;
 		      auto itr2 = archiveIndices.find(url);
 		      if(itr2 == archiveIndices.end())
 		      {
-		    	  log->Dump(XrdCl::XRootDMsg, "EC Vector Read: Couldn't find host for file.");
+		    	  log->Dump(XrdCl::XRootDMsg, "EC Vector Read: Couldn't find host index for file %s.", fn.c_str());
 		    	  break;
 		      }
 		      size_t indexOfArchive = archiveIndices[url];
@@ -1037,7 +1050,7 @@ namespace XrdEc
 											//---------------------------------------------------
 											if( !st.IsOK() )
 											{
-												log->Dump(XrdCl::XRootDMsg, "EC Vector Read: Couldn't read CRC32 from CD.");
+											log->Dump(XrdCl::XRootDMsg, "EC Vector Read: Couldn't read CRC32 from CD for blk %zu stripe %zu host %zu.", blkid, strpid, i);
 												this->MissingVectorRead(currentBlock, blkid, strpid, timeout);
 												continue;
 											}
@@ -1047,7 +1060,7 @@ namespace XrdEc
 											uint32_t cksum = objcfg.digest( 0, currentBlock->stripes[strpid].data(), currentBlock->stripes[strpid].size() );
 											if( orgcksum != cksum )
 											{
-												log->Dump(XrdCl::XRootDMsg, "EC Vector Read: Wrong checksum for block %zu stripe %zu.", blkid, strpid);
+												log->Dump(XrdCl::XRootDMsg, "EC Vector Read: Wrong checksum for block %zu stripe %zu host %zu.", blkid, strpid, i);
 												this->MissingVectorRead(currentBlock, blkid, strpid, timeout);
 												continue;
 											}
@@ -1100,11 +1113,11 @@ namespace XrdEc
 			      }
           {
             std::unique_lock<std::mutex> l(*blockMap[blkid]->mtx_ptr());
-            if(blockMap[blkid]->state[strpid] != block_t::Valid){
-              log->Dump(XrdCl::XRootDMsg, "EC Vector Read: Invalid stripe in block %zu stripe %zu.", blkid, strpid);
-              failed = true;
-              break;
-            }
+			    if(blockMap[blkid]->state[strpid] != block_t::Valid){
+			    	  log->Dump(XrdCl::XRootDMsg, "EC Vector Read: Invalid stripe in block %zu stripe %zu.", blkid, strpid);
+			    	  failed = true;
+			    	  break;
+			    }
             memcpy(localBuffer, blockMap[blkid]->stripe_ref(strpid).data() + rdoff, rdsize);
           }
 

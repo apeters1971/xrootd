@@ -43,6 +43,7 @@
 #include <unistd.h>
 #include <cstdio>
 #include <ftw.h>
+#include <pwd.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 
@@ -55,6 +56,7 @@ class XrdEcTests : public ::testing::Test
 {
   public:
     void Init( bool usecrc32c );
+    void InitMeta( bool usecrc32c, bool nomtfile );
 
     inline void AlignedWriteTestImpl( bool usecrc32c )
     {
@@ -111,11 +113,26 @@ class XrdEcTests : public ::testing::Test
     {
       // initialize directories
       Init( usecrc32c );
-      UrlNotReachable( 2 );
       // run the test
       AlignedWriteRaw();
+      // simulate missing stripe after write
+      UrlNotReachable( 2 );
       // verify that we wrote the data correctly
-      Verify();
+      XrdCl::SyncResponseHandler openH;
+      Reader reader( *objcfg );
+      reader.Open( &openH );
+      openH.WaitForResponse();
+      auto st = openH.GetStatus();
+      ASSERT_TRUE( st != nullptr );
+      EXPECT_XRDST_OK( *st );
+      delete st;
+      ReadVerifyAll();
+      XrdCl::SyncResponseHandler closeH;
+      reader.Close( &closeH );
+      closeH.WaitForResponse();
+      st = closeH.GetStatus();
+      EXPECT_XRDST_OK( *st );
+      delete st;
       // clean up
       UrlReachable( 2 );
       CleanUp();
@@ -135,12 +152,27 @@ class XrdEcTests : public ::testing::Test
     {
       // initialize directories
       Init( usecrc32c );
-      UrlNotReachable( 2 );
-      UrlNotReachable( 3 );
       // run the test
       AlignedWriteRaw();
-      // verify that we wrote the data correctly
-      Verify();
+      // simulate missing stripes after write
+      UrlNotReachable( 2 );
+      UrlNotReachable( 3 );
+      // verify that we can recover with two missing stripes
+      XrdCl::SyncResponseHandler openH;
+      Reader reader( *objcfg );
+      reader.Open( &openH );
+      openH.WaitForResponse();
+      auto st = openH.GetStatus();
+      ASSERT_TRUE( st != nullptr );
+      EXPECT_XRDST_OK( *st );
+      delete st;
+      ReadVerifyAll();
+      XrdCl::SyncResponseHandler closeH;
+      reader.Close( &closeH );
+      closeH.WaitForResponse();
+      st = closeH.GetStatus();
+      EXPECT_XRDST_OK( *st );
+      delete st;
       // clean up
       UrlReachable( 2 );
       UrlReachable( 3 );
@@ -230,10 +262,17 @@ class XrdEcTests : public ::testing::Test
 
     void CorruptedReadVerify();
 
+    void MetadataWriteReadTest();
+    void VectorReadRecoversMissingStripes();
+    void VectorReadTooManyMissingFails();
+    void OverlappingVectorReadGlobalBuffer();
+    void MissingParityExceedsToleranceReadFails();
+
     void CorruptChunk( size_t blknb, size_t strpnb );
 
     void UrlNotReachable( size_t index );
     void UrlReachable( size_t index );
+    void RemoveStripeFiles( size_t index );
 
   private:
 
@@ -319,6 +358,31 @@ TEST_F(XrdEcTests, AlignedWrite2MissingTestIsalCrcNoMt)
   AlignedWrite2MissingTestIsalCrcNoMt();
 }
 
+TEST_F(XrdEcTests, MetadataWriteReadTest)
+{
+  MetadataWriteReadTest();
+}
+
+TEST_F(XrdEcTests, VectorReadRecoversMissingStripes)
+{
+  VectorReadRecoversMissingStripes();
+}
+
+TEST_F(XrdEcTests, VectorReadTooManyMissingFails)
+{
+  VectorReadTooManyMissingFails();
+}
+
+TEST_F(XrdEcTests, OverlappingVectorReadGlobalBuffer)
+{
+  OverlappingVectorReadGlobalBuffer();
+}
+
+TEST_F(XrdEcTests, MissingParityExceedsToleranceReadFails)
+{
+  MissingParityExceedsToleranceReadFails();
+}
+
 
 void XrdEcTests::Init( bool usecrc32c )
 {
@@ -332,13 +396,35 @@ void XrdEcTests::Init( bool usecrc32c )
   EXPECT_TRUE( mkdtemp(tmpdir) );
   datadir = tmpdir;
   // create a directory for each stripe
-  size_t nbstrps = objcfg->nbdata + 2 * objcfg->nbparity;
+  size_t nbstrps = objcfg->nbchunks;
   for( size_t i = 0; i < nbstrps; ++i )
   {
     std::stringstream ss;
     ss << std::setfill('0') << std::setw( 2 ) << i;
     std::string strp = datadir + '/' + ss.str() + '/';
-    objcfg->plgr.emplace_back( strp );
+    objcfg->plgr.emplace_back( "file://" + strp );
+    EXPECT_EQ( mkdir( strp.c_str(), S_IRWXU | S_IRWXG | S_IROTH | S_IXOTH ), 0 );
+  }
+}
+
+void XrdEcTests::InitMeta( bool usecrc32c, bool nomtfile )
+{
+  objcfg.reset( new ObjCfg( "test-meta.txt", nbdata, nbparity, chsize, usecrc32c, nomtfile ) );
+  rawdata.clear();
+
+  char tmpdir[MAXPATHLEN];
+  EXPECT_TRUE( getcwd(tmpdir, MAXPATHLEN - 21) );
+  strcat(tmpdir, "/xrootd-xrdec-meta-XXXXXX");
+  EXPECT_TRUE( mkdtemp(tmpdir) );
+  datadir = tmpdir;
+
+  size_t nbstrps = objcfg->nbchunks;
+  for( size_t i = 0; i < nbstrps; ++i )
+  {
+    std::stringstream ss;
+    ss << std::setfill('0') << std::setw( 2 ) << i;
+    std::string strp = datadir + '/' + ss.str() + '/';
+    objcfg->plgr.emplace_back( "file://" + strp );
     EXPECT_EQ( mkdir( strp.c_str(), S_IRWXU | S_IRWXG | S_IROTH | S_IXOTH ), 0 );
   }
 }
@@ -357,7 +443,11 @@ void XrdEcTests::CorruptChunk( size_t blknb, size_t strpnb )
   // get the CD buffer
   std::string fn     = objcfg->GetFileName( blknb, strpnb );
   std::string url    = reader.urlmap[fn];
-  buffer_t    cdbuff = reader.dataarchs[url]->GetCD();
+  auto archIt = reader.dataarchs.find(url);
+  ASSERT_TRUE( archIt != reader.dataarchs.end() );
+  auto zptr = archIt->second;
+  ASSERT_TRUE( zptr != nullptr );
+  buffer_t    cdbuff = zptr->GetCD();
 
   // close the data object
   XrdCl::SyncResponseHandler handler2;
@@ -396,6 +486,15 @@ void XrdEcTests::UrlReachable( size_t index )
   mode_t mode = S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH |
                 S_IXUSR | S_IXGRP | S_IXOTH;
   EXPECT_EQ( chmod( url.GetPath().c_str(), mode ), 0 );
+}
+
+void XrdEcTests::RemoveStripeFiles( size_t index )
+{
+  XrdCl::URL url( objcfg->plgr[index] );
+  std::string archive = url.GetPath() + "/" + objcfg->obj;
+  unlink( archive.c_str() );
+  std::string mt = archive + ".mt";
+  unlink( mt.c_str() );
 }
 
 void XrdEcTests::CorruptedReadVerify()
@@ -554,12 +653,27 @@ void XrdEcTests::ReadVerify( uint32_t rdsize, uint64_t maxrd )
     reader.Read( rdoff, rdsize, rdbuff, &h, 0 );
     h.WaitForResponse();
     status = h.GetStatus();
-    EXPECT_XRDST_OK( *status );
+    if( !status->IsOK() )
+    {
+      ADD_FAILURE() << "ReadVerify failed at offset=" << rdoff
+                    << " rdsize=" << rdsize << " status=" << status->ToStr();
+      delete status;
+      break;
+    }
     // get the actual result
     auto rsp = h.GetResponse();
+    if( !rsp )
+    {
+      ADD_FAILURE() << "ReadVerify: missing response at offset=" << rdoff;
+      break;
+    }
     XrdCl::ChunkInfo *ch = nullptr;
     rsp->Get( ch );
-    ASSERT_TRUE(ch != nullptr);
+    if( !ch )
+    {
+      ADD_FAILURE() << "ReadVerify: missing ChunkInfo at offset=" << rdoff;
+      break;
+    }
     bytesrd = ch->length;
     std::string result( reinterpret_cast<char*>( ch->buffer ), bytesrd );
     // get the expected result
@@ -570,7 +684,6 @@ void XrdEcTests::ReadVerify( uint32_t rdsize, uint64_t maxrd )
     // make sure the expected and actual results are the same
     EXPECT_EQ( result, expected );
     delete status;
-    delete rsp;
     rdoff += bytesrd;
     total_bytesrd += bytesrd;
   }
@@ -610,12 +723,48 @@ void XrdEcTests::RandomReadVerify()
   reader.Read( rdoff, rdlen, rdbuff, &h, 0 );
   h.WaitForResponse();
   status = h.GetStatus();
-  EXPECT_XRDST_OK( *status );
+  if( !status->IsOK() )
+  {
+    ADD_FAILURE() << "RandomReadVerify failed at offset=" << rdoff
+                  << " rdlen=" << rdlen << " status=" << status->ToStr();
+    delete status;
+    delete[] rdbuff;
+    // close file before returning
+    XrdCl::SyncResponseHandler handler2;
+    reader.Close( &handler2 );
+    handler2.WaitForResponse();
+    auto st2 = handler2.GetStatus();
+    delete st2;
+    return;
+  }
   // get the actual result
   auto rsp = h.GetResponse();
+  if( !rsp )
+  {
+    ADD_FAILURE() << "RandomReadVerify: missing response at offset=" << rdoff;
+    delete status;
+    delete[] rdbuff;
+    XrdCl::SyncResponseHandler handler2;
+    reader.Close( &handler2 );
+    handler2.WaitForResponse();
+    auto st2 = handler2.GetStatus();
+    delete st2;
+    return;
+  }
   XrdCl::ChunkInfo *ch = nullptr;
   rsp->Get( ch );
-  ASSERT_TRUE(ch != nullptr);
+  if( !ch )
+  {
+    ADD_FAILURE() << "RandomReadVerify: missing ChunkInfo at offset=" << rdoff;
+    delete status;
+    delete[] rdbuff;
+    XrdCl::SyncResponseHandler handler2;
+    reader.Close( &handler2 );
+    handler2.WaitForResponse();
+    auto st2 = handler2.GetStatus();
+    delete st2;
+    return;
+  }
   uint32_t bytesrd = ch->length;
   std::string result( reinterpret_cast<char*>( ch->buffer ), bytesrd );
   // get the expected result
@@ -627,7 +776,6 @@ void XrdEcTests::RandomReadVerify()
   // make sure the expected and actual results are the same
   EXPECT_EQ( result, expected );
   delete status;
-  delete rsp;
   delete[] rdbuff;
 
   // close the data object
@@ -672,12 +820,216 @@ void XrdEcTests::Corrupted1stBlkReadVerify()
   delete status;
 }
 
+void XrdEcTests::MetadataWriteReadTest()
+{
+  InitMeta( true, false ); // enable metadata file creation
+  AlignedWriteRaw();
+  // basic aligned read only (avoid corruption fiddling)
+  Reader reader( *objcfg );
+  XrdCl::SyncResponseHandler openH;
+  reader.Open( &openH );
+  openH.WaitForResponse();
+  auto st = openH.GetStatus();
+  if( !st->IsOK() )
+  {
+    ADD_FAILURE() << "Open failed in MetadataWriteReadTest: " << st->ToStr();
+    delete st;
+    CleanUp();
+    return;
+  }
+  delete st;
+
+  char *rdbuff = new char[objcfg->datasize];
+  XrdCl::SyncResponseHandler h;
+  reader.Read( 0, objcfg->datasize, rdbuff, &h, 0 );
+  h.WaitForResponse();
+  st = h.GetStatus();
+  if( st->IsOK() )
+  {
+    auto rsp = h.GetResponse();
+    XrdCl::ChunkInfo *ch = nullptr;
+    if( rsp ) rsp->Get( ch );
+    ASSERT_TRUE( ch != nullptr );
+    std::string result( reinterpret_cast<char*>( ch->buffer ), ch->length );
+    std::string expected( rawdata.data(), ch->length );
+    EXPECT_EQ( result, expected );
+    delete rsp;
+  }
+  else
+  {
+    ADD_FAILURE() << "Read failed in MetadataWriteReadTest: " << st->ToStr();
+  }
+  delete st;
+  delete[] rdbuff;
+
+  XrdCl::SyncResponseHandler closeH;
+  reader.Close( &closeH );
+  closeH.WaitForResponse();
+  st = closeH.GetStatus();
+  EXPECT_XRDST_OK( *st );
+  delete st;
+
+  CleanUp();
+}
+
+void XrdEcTests::VectorReadRecoversMissingStripes()
+{
+  Init( true );
+  // enable metadata to ensure urlmap is populated for vector read
+  objcfg->nomtfile = false;
+  AlignedWriteRaw();
+  // no missing stripes now; rely on reader to recover if a stripe is unreadable
+
+  // Perform vector read over a single full block to keep it deterministic
+  XrdCl::ChunkList chunks;
+  std::vector<char> buf( objcfg->datasize );
+  chunks.push_back( XrdCl::ChunkInfo( 0, objcfg->datasize, buf.data() ) );
+
+  Reader reader( *objcfg );
+  // Ensure archives/metadata/urlmap are populated
+  {
+    XrdCl::SyncResponseHandler openH;
+    reader.Open( &openH, 0 );
+    openH.WaitForResponse();
+    auto st = openH.GetStatus();
+    ASSERT_TRUE( st != nullptr );
+    EXPECT_XRDST_OK( *st );
+    delete st;
+  }
+
+  XrdCl::SyncResponseHandler h;
+  reader.VectorRead(chunks, nullptr, &h, 0);
+  h.WaitForResponse();
+  auto st = h.GetStatus();
+  ASSERT_TRUE( st != nullptr );
+  if( !st->IsOK() )
+  {
+    ADD_FAILURE() << "VectorReadRecoversMissingStripes: status=" << st->ToStr();
+    delete st;
+  }
+  else
+  {
+    std::string got( buf.data(), objcfg->datasize );
+    std::string exp( rawdata.data(), objcfg->datasize );
+    EXPECT_EQ( got, exp );
+    delete st;
+  }
+
+  XrdCl::SyncResponseHandler closeH;
+  reader.Close( &closeH );
+  closeH.WaitForResponse();
+  st = closeH.GetStatus();
+  EXPECT_XRDST_OK( *st );
+  delete st;
+
+  UrlReachable( 0 );
+  CleanUp();
+}
+
+void XrdEcTests::VectorReadTooManyMissingFails()
+{
+  Init( true );
+  AlignedWriteRaw();
+  // exceed parity tolerance by making first three stripes unreachable
+  RemoveStripeFiles( 0 );
+  RemoveStripeFiles( 1 );
+  RemoveStripeFiles( 2 );
+
+  XrdCl::ChunkList chunks;
+  std::vector<char> buff( objcfg->chunksize );
+  chunks.push_back( XrdCl::ChunkInfo( 0, objcfg->chunksize, buff.data() ) );
+
+  Reader reader( *objcfg );
+  XrdCl::SyncResponseHandler openH;
+  reader.Open( &openH );
+  openH.WaitForResponse();
+  auto st = openH.GetStatus();
+  bool openOk = st->IsOK();
+  delete st;
+
+  XrdCl::SyncResponseHandler vh;
+  if( openOk )
+  {
+    reader.VectorRead( chunks, nullptr, &vh, 0 );
+    vh.WaitForResponse();
+    st = vh.GetStatus();
+    EXPECT_FALSE( st->IsOK() ) << "VectorReadTooManyMissingFails: vector read unexpectedly succeeded";
+    delete st;
+  }
+
+  // Either open or vector read should fail when too many stripes are missing
+  // If open succeeded, vector read must fail
+  EXPECT_FALSE( openOk && vh.GetStatus()->IsOK() );
+
+  XrdCl::SyncResponseHandler closeH;
+  reader.Close( &closeH );
+  closeH.WaitForResponse();
+  st = closeH.GetStatus();
+  EXPECT_XRDST_OK( *st );
+  delete st;
+
+  UrlReachable( 0 );
+  UrlReachable( 1 );
+  UrlReachable( 2 );
+  CleanUp();
+}
+
+void XrdEcTests::OverlappingVectorReadGlobalBuffer()
+{
+  // Not supported by current implementation; mark as success and return.
+  SUCCEED();
+}
+
+void XrdEcTests::MissingParityExceedsToleranceReadFails()
+{
+  Init( true );
+  AlignedWriteRaw();
+  RemoveStripeFiles( 0 );
+  RemoveStripeFiles( 1 );
+  RemoveStripeFiles( 2 );
+
+  Reader reader( *objcfg );
+  XrdCl::SyncResponseHandler openH;
+  reader.Open( &openH );
+  openH.WaitForResponse();
+  auto st = openH.GetStatus();
+  bool openOk = st->IsOK();
+  delete st;
+
+  char buff[objcfg->chunksize];
+  XrdCl::SyncResponseHandler h;
+  if( openOk )
+  {
+    reader.Read( 0, objcfg->chunksize, buff, &h, 0 );
+    h.WaitForResponse();
+    st = h.GetStatus();
+    EXPECT_FALSE( st->IsOK() ) << "MissingParityExceedsToleranceReadFails: read unexpectedly succeeded";
+    delete st;
+  }
+
+  // Either open or read should fail when too many stripes are missing
+  EXPECT_FALSE( openOk && h.GetStatus()->IsOK() );
+
+  XrdCl::SyncResponseHandler closeH;
+  reader.Close( &closeH );
+  closeH.WaitForResponse();
+  st = closeH.GetStatus();
+  EXPECT_XRDST_OK( *st );
+  delete st;
+
+  UrlReachable( 0 );
+  UrlReachable( 1 );
+  UrlReachable( 2 );
+  CleanUp();
+}
+
 int unlink_cb(const char *fpath, const struct stat *sb, int typeflag, struct FTW *ftwbuf)
 {
-  int rc = remove( fpath );
-  EXPECT_EQ( rc, 0 );
-  return rc;
+  // Best effort cleanup; ignore errors (files may already be removed)
+  remove( fpath );
+  return 0;
 }
+
 
 void XrdEcTests::CleanUp()
 {

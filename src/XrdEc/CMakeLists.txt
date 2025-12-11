@@ -34,3 +34,20 @@ install(
 )
 
 install(TARGETS XrdEc LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR})
+
+# ----------------------------------------------------------------------
+# Client-side EC plugin (built separately to avoid XrdCl<->XrdEc cycles)
+# ----------------------------------------------------------------------
+if(BUILD_XRDEC)
+  add_library(XrdEcDefault SHARED
+    ../XrdCl/XrdClEcHandler.cc
+    ../XrdCl/XrdClEcHandler.hh
+    XrdEcDefaultPlugin.cc
+  )
+
+  target_include_directories(XrdEcDefault PRIVATE ../XrdCl ${ISAL_INCLUDE_DIRS})
+  target_link_libraries(XrdEcDefault PRIVATE XrdEc XrdCl XrdUtils ${ISAL_LIBRARIES})
+  set_target_properties(XrdEcDefault PROPERTIES VERSION 1.0.0 SOVERSION 1)
+
+  install(TARGETS XrdEcDefault LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR})
+endif()
